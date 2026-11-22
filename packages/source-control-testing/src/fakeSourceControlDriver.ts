@@ -116,6 +116,7 @@ export interface FakeSourceControlDriverOptions {
   readonly pullRequests?: Partial<PullRequestProviderApi> | null;
   readonly discovery?: SourceControlProviderDiscoverySpec;
   readonly fetchMedia?: SourceControlDriverInstance["fetchMedia"];
+  readonly uploadMedia?: SourceControlDriverInstance["uploadMedia"];
 }
 
 /** A driver instance for a host named `kind` that needs none of the server's services. */
@@ -129,5 +130,6 @@ export function fakeSourceControlDriverInstance(
     pullRequests:
       options.pullRequests === null ? null : fakePullRequestProvider(kind, options.pullRequests),
     ...(options.fetchMedia === undefined ? {} : { fetchMedia: options.fetchMedia }),
+    ...(options.uploadMedia === undefined ? {} : { uploadMedia: options.uploadMedia }),
   };
 }

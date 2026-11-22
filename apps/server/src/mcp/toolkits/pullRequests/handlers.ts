@@ -1,5 +1,6 @@
 import {
   CommandId,
+  GitManagerError,
   NonNegativeInt,
   type PullRequestActivity,
   PullRequestListCursors,
@@ -11,10 +12,12 @@ import {
   type PullRequestState,
   type PullRequestWatchUntil,
   type OrchestrationV2ThreadShell,
+  type SourceControlProviderKind,
   type ThreadId,
   type ThreadPullRequestLink,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import type { MarkdownAttachmentInput } from "@t3tools/source-control-core/server/markdownAttachments";
 import * as Cause from "effect/Cause";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
@@ -29,6 +32,7 @@ import * as PullRequestWatchService from "../../../pullRequest/PullRequestWatchS
 import { resolveTarget, type ResolvedTarget } from "../../../pullRequest/pullRequestTarget.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
+import * as SourceControlMediaUploadService from "../../../sourceControl/SourceControlMediaUploadService.ts";
 import { reviewPositionInPatch } from "../../../pullRequest/pullRequestReviewPosition.ts";
 import {
   ownPullRequestRepositories,
@@ -267,10 +271,54 @@ const make = Effect.gen(function* () {
   const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
   const watches = yield* PullRequestWatchService.PullRequestWatchService;
   const pullRequests = yield* PullRequestService.PullRequestService;
+  const mediaUploads = yield* SourceControlMediaUploadService.SourceControlMediaUploadService;
   const git = yield* GitManager.GitManager;
 
   const projects = yield* ProjectService.ProjectService;
   const random = yield* SecureRandom.SecureRandom;
+
+  const resolveMediaProvider = (
+    host: string,
+    project: OrchestrationProjectShell | undefined,
+  ): SourceControlProviderKind | null => {
+    const recognizedKind = sourceControlDefinitions.recognizeRemote(`https://${host}`)?.kind;
+    return (
+      sourceControlDefinitions.findByPublicHost(host)?.kind ??
+      (recognizedKind === "gitcafe"
+        ? recognizedKind
+        : (project?.repositoryIdentity?.provider ?? null))
+    );
+  };
+
+  const attachMedia = Effect.fn("PullRequestsToolkit.attachMedia")(function* (input: {
+    readonly project: OrchestrationProjectShell;
+    readonly thread: OrchestrationV2ThreadShell;
+    readonly host: string;
+    readonly repository: string;
+    readonly markdown: string;
+    readonly attachments: ReadonlyArray<MarkdownAttachmentInput> | undefined;
+  }) {
+    if (input.attachments === undefined || input.attachments.length === 0) {
+      return input.markdown;
+    }
+    const provider = resolveMediaProvider(input.host, input.project);
+    if (provider === null) {
+      return yield* new PullRequestForgeError({
+        detail: `Could not determine which forge hosts ${input.host} to upload attachments.`,
+      });
+    }
+    const attached = yield* mediaUploads
+      .attachToMarkdown({
+        provider,
+        host: input.host,
+        repository: input.repository,
+        cwd: input.thread.worktreePath ?? input.project.workspaceRoot,
+        markdown: input.markdown,
+        attachments: input.attachments,
+      })
+      .pipe(Effect.mapError(forgeFailure));
+    return attached.markdown;
+  });
 
   const commandId = (tag: string, threadId: ThreadId) =>
     random.uuidV4().pipe(
@@ -1048,12 +1096,51 @@ const make = Effect.gen(function* () {
         if (project === undefined) {
           return yield* new PullRequestProjectNotFoundError({ repository: "" });
         }
+        const cwd = thread.worktreePath ?? project.workspaceRoot;
+        let prepareBody: ((body: string) => Effect.Effect<string, GitManagerError>) | undefined;
+        if (input.attachments !== undefined && input.attachments.length > 0) {
+          const own = ownPullRequestRepositories(project.repositoryIdentity)[0]?.key;
+          const provider = own === undefined ? null : resolveMediaProvider(own.host, project);
+          if (own === undefined || provider === null) {
+            return yield* new PullRequestForgeError({
+              detail: "Could not determine the repository to upload attachments to.",
+            });
+          }
+          // Validate attachments before pushing so bad paths or unsupported hosts fail fast.
+          yield* mediaUploads
+            .validate({ provider, cwd, attachments: input.attachments })
+            .pipe(Effect.mapError(forgeFailure));
+          const attachments = input.attachments;
+          prepareBody = (body) =>
+            mediaUploads
+              .attachToMarkdown({
+                provider,
+                host: own.host,
+                repository: own.repository,
+                cwd,
+                markdown: body,
+                attachments,
+              })
+              .pipe(
+                Effect.map((result) => result.markdown),
+                Effect.mapError(
+                  (cause) =>
+                    new GitManagerError({
+                      operation: "createPullRequest",
+                      cwd,
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+        }
         const created = yield* git
           .createPullRequest({
-            cwd: thread.worktreePath ?? project.workspaceRoot,
+            cwd,
             projectId: project.id,
             title: input.title,
             body: input.body,
+            ...(prepareBody === undefined ? {} : { prepareBody }),
             baseBranch: input.base,
             draft: input.draft,
             private: input.private,
@@ -1081,6 +1168,7 @@ const make = Effect.gen(function* () {
         if (
           input.title === undefined &&
           input.body === undefined &&
+          input.attachments === undefined &&
           input.ready === undefined &&
           input.state === undefined &&
           input.addLabels === undefined &&
@@ -1088,16 +1176,33 @@ const make = Effect.gen(function* () {
           input.requestReviewers === undefined
         ) {
           return yield* new PullRequestNothingToDoError({
-            detail: "Pass title, body, ready, state, addLabels, removeLabels, or requestReviewers.",
+            detail:
+              "Pass title, body, attachments, ready, state, addLabels, removeLabels, or requestReviewers.",
           });
         }
-        const { target, ref } = yield* locate(input);
-        if (input.title !== undefined || input.body !== undefined) {
+        const { thread, project, target, ref } = yield* locate(input);
+        let body = input.body;
+        if (input.attachments !== undefined && input.attachments.length > 0) {
+          const baseBody =
+            body ??
+            (yield* pullRequests
+              .detail({ ...ref, allowStale: false })
+              .pipe(Effect.mapError(forgeFailure))).body;
+          body = yield* attachMedia({
+            project,
+            thread,
+            host: target.host,
+            repository: target.repository,
+            markdown: baseBody,
+            attachments: input.attachments,
+          });
+        }
+        if (input.title !== undefined || body !== undefined) {
           yield* pullRequests
             .update({
               ...ref,
               ...(input.title === undefined ? {} : { title: input.title }),
-              ...(input.body === undefined ? {} : { body: input.body }),
+              ...(body === undefined ? {} : { body }),
             })
             .pipe(Effect.mapError(forgeFailure));
         }
@@ -1134,12 +1239,10 @@ const make = Effect.gen(function* () {
     ),
     pull_request_respond: McpToolAccess.writesWithCapability((input) =>
       Effect.gen(function* () {
-        if (
-          input.body === undefined &&
-          (input.reviewThreadId === undefined || input.resolved === undefined)
-        ) {
+        const hasReply = input.body !== undefined || input.attachments !== undefined;
+        if (!hasReply && (input.reviewThreadId === undefined || input.resolved === undefined)) {
           return yield* new PullRequestNothingToDoError({
-            detail: "Pass body, or reviewThreadId with resolved.",
+            detail: "Pass body, attachments, or reviewThreadId with resolved.",
           });
         }
         if (input.reviewThreadId === undefined && input.resolved !== undefined) {
@@ -1147,13 +1250,21 @@ const make = Effect.gen(function* () {
             detail: "resolved needs reviewThreadId.",
           });
         }
-        const { target, ref } = yield* locate(input);
+        const { thread, project, target, ref } = yield* locate(input);
         const reviewThreadId = input.reviewThreadId;
-        if (input.body !== undefined) {
+        if (hasReply) {
+          const body = yield* attachMedia({
+            project,
+            thread,
+            host: target.host,
+            repository: target.repository,
+            markdown: input.body ?? "",
+            attachments: input.attachments,
+          });
           yield* (
             reviewThreadId === undefined
-              ? pullRequests.comment({ ...ref, body: input.body })
-              : pullRequests.replyToThread({ ...ref, threadId: reviewThreadId, body: input.body })
+              ? pullRequests.comment({ ...ref, body })
+              : pullRequests.replyToThread({ ...ref, threadId: reviewThreadId, body })
           ).pipe(Effect.mapError(forgeFailure));
         }
         if (reviewThreadId !== undefined && input.resolved !== undefined) {
@@ -1161,11 +1272,11 @@ const make = Effect.gen(function* () {
             .setThreadResolution({ ...ref, threadId: reviewThreadId, resolved: input.resolved })
             .pipe(
               Effect.mapError((error) =>
-                input.body === undefined
+                !hasReply
                   ? forgeFailure(error)
                   : new PullRequestForgeError({
-                      // A retry with the body would post the reply twice.
-                      detail: `The reply was posted, but setting resolved failed: ${error.message} Retry without body.`,
+                      // A retry with the body or attachments would post the reply twice.
+                      detail: `The reply was posted, but setting resolved failed: ${error.message} Retry without body or attachments.`,
                       cause: error,
                     }),
               ),
@@ -1173,17 +1284,25 @@ const make = Effect.gen(function* () {
         }
         return {
           ...identityOf(target),
-          replied: input.body !== undefined,
+          replied: hasReply,
           resolved: input.resolved ?? null,
         };
       }),
     ),
     pull_request_review: McpToolAccess.writesWithCapability((input) =>
       Effect.gen(function* () {
-        const { target, ref } = yield* locate(input);
+        const { thread, project, target, ref } = yield* locate(input);
         const comments = yield* reviewComments(ref, input.comments ?? []);
+        const body = yield* attachMedia({
+          project,
+          thread,
+          host: target.host,
+          repository: target.repository,
+          markdown: input.body ?? "",
+          attachments: input.attachments,
+        });
         yield* pullRequests
-          .submitReview({ ...ref, verdict: input.verdict, body: input.body ?? "", comments })
+          .submitReview({ ...ref, verdict: input.verdict, body, comments })
           .pipe(Effect.mapError(forgeFailure));
         return identityOf(target);
       }),

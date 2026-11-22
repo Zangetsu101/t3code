@@ -197,6 +197,12 @@ export class GitManager extends Context.Service<
       readonly projectId: ProjectId;
       readonly title: string;
       readonly body: string;
+      /**
+       * Optional transform invoked only when a new PR is actually being created (after pushing
+       * and confirming no open PR already exists), so side effects like media uploads are never
+       * stranded on a push failure or existing-PR reuse.
+       */
+      readonly prepareBody?: (body: string) => Effect.Effect<string, GitManagerError>;
       readonly baseBranch?: string | undefined;
       readonly draft?: boolean | undefined;
       /**
@@ -2975,12 +2981,13 @@ export const make = Effect.gen(function* () {
         title: existing.title,
       };
     }
+    const body = input.prepareBody ? yield* input.prepareBody(input.body) : input.body;
     const bodyFile = path.join(
       tempDir,
       `t3code-pr-body-${process.pid}-${yield* randomUUIDv4(cwd)}.md`,
     );
     yield* fileSystem
-      .writeFileString(bodyFile, input.body)
+      .writeFileString(bodyFile, body)
       .pipe(
         Effect.mapError((cause) => fail("Failed to write pull request body temp file.", cause)),
       );
@@ -3052,7 +3059,12 @@ export const make = Effect.gen(function* () {
           : undefined,
         input.baseBranch,
         input.draft === true,
-        () => Effect.succeed({ title: input.title, body: input.body }),
+        () =>
+          input.prepareBody
+            ? input
+                .prepareBody(input.body)
+                .pipe(Effect.map((body) => ({ title: input.title, body })))
+            : Effect.succeed({ title: input.title, body: input.body }),
       );
     }).pipe(
       // A push changes the ahead count, and a new PR changes the branch's PR lookup, so

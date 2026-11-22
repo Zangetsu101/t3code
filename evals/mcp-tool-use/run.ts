@@ -1610,7 +1610,7 @@ export const t3Default = (
     case "pull_request_respond":
       return {
         ...pullRequest(sample.repo, { number: input.number ?? branchPullRequest(sample).number }),
-        replied: input.body !== undefined,
+        replied: input.body !== undefined || input.attachments !== undefined,
         resolved: typeof input.resolved === "boolean" ? input.resolved : null,
       };
     case "pull_request_merge": {

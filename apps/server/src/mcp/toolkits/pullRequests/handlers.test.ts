@@ -37,6 +37,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as PullRequestWatchService from "../../../pullRequest/PullRequestWatchService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
+import * as SourceControlMediaUploadService from "../../../sourceControl/SourceControlMediaUploadService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as McpToolAccessTestkit from "../../McpToolAccess.testkit.ts";
@@ -154,6 +155,9 @@ interface HarnessOptions {
     PullRequestOperationError
   >;
   readonly pullRequests?: Partial<PullRequestService.PullRequestService["Service"]>;
+  readonly mediaUploads?: Partial<
+    SourceControlMediaUploadService.SourceControlMediaUploadService["Service"]
+  >;
   readonly git?: Partial<GitManager.GitManager["Service"]>;
 }
 
@@ -208,6 +212,9 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       dispatch,
     }),
     Layer.mock(PullRequestService.PullRequestService)(options.pullRequests ?? {}),
+    Layer.mock(SourceControlMediaUploadService.SourceControlMediaUploadService)(
+      options.mediaUploads ?? {},
+    ),
     Layer.mock(GitManager.GitManager)(options.git ?? {}),
     Layer.succeed(SecureRandom.SecureRandom, testCrypto),
     McpToolAccessTestkit.liveThreadsLayer,
@@ -1376,6 +1383,124 @@ describe("source control tools", () => {
         .call("pull_request_update", { requestReviewers: ["nobody"] })
         .pipe(Effect.flip);
       expect(unknown.message).toContain("No reviewer named nobody");
+    }),
+  );
+
+  it.effect("uploads attachments in pull_request_create, update, respond, and review", () =>
+    Effect.gen(function* () {
+      const uploadedCalls: Array<{
+        readonly repository: string;
+        readonly markdown: string;
+        readonly paths: ReadonlyArray<string>;
+      }> = [];
+      const validatedPaths: Array<ReadonlyArray<string>> = [];
+      const detailRequests: Array<{ readonly allowStale?: boolean }> = [];
+      const createdBodies: Array<string> = [];
+      const updatedBodies: Array<string> = [];
+      const comments: Array<string> = [];
+      const reviewBodies: Array<string> = [];
+
+      const harness = yield* makeHarness({
+        thread: branchThread,
+        mediaUploads: {
+          validate: (input) =>
+            Effect.sync(() => {
+              validatedPaths.push(input.attachments.map((item) => item.path));
+              return [];
+            }),
+          attachToMarkdown: (input) =>
+            Effect.sync(() => {
+              uploadedCalls.push({
+                repository: input.repository,
+                markdown: input.markdown,
+                paths: input.attachments.map((item) => item.path),
+              });
+              const suffix = input.attachments
+                .map(
+                  (item) =>
+                    `![${item.alt ?? "img"}](https://github.com/user-attachments/assets/${item.path})`,
+                )
+                .join("\n\n");
+              return {
+                markdown: input.markdown === "" ? suffix : `${input.markdown}\n\n${suffix}`,
+                uploaded: input.attachments.map((item) => ({
+                  path: item.path,
+                  url: `https://github.com/user-attachments/assets/${item.path}`,
+                })),
+              };
+            }),
+        },
+        git: {
+          createPullRequest: (input) =>
+            Effect.gen(function* () {
+              const finalBody = input.prepareBody
+                ? yield* input.prepareBody(input.body)
+                : input.body;
+              createdBodies.push(finalBody);
+              return {
+                status: "created",
+                url: "https://github.com/t3tools/t3code/pull/9",
+                number: 9,
+                baseBranch: "main",
+                headBranch: "feat/demo",
+                title: input.title,
+              };
+            }),
+        },
+        pullRequests: {
+          detail: (input) =>
+            Effect.sync(() => {
+              detailRequests.push(
+                input.allowStale === undefined ? {} : { allowStale: input.allowStale },
+              );
+              return { body: "Existing body" } as PullRequestDetail;
+            }),
+          update: (input) =>
+            Effect.sync(() => {
+              if (input.body !== undefined) updatedBodies.push(input.body);
+            }),
+          comment: (input) =>
+            Effect.sync(() => {
+              comments.push(input.body);
+            }),
+          submitReview: (input) =>
+            Effect.sync(() => {
+              reviewBodies.push(input.body);
+            }),
+        },
+      });
+
+      yield* harness.call("pull_request_create", {
+        title: "UI fix",
+        body: "Before and after",
+        attachments: [{ path: "after.png", alt: "After" }],
+      });
+      yield* harness.call("pull_request_update", {
+        attachments: [{ path: "extra.png" }],
+      });
+      const responded = yield* harness.call("pull_request_respond", {
+        attachments: [{ path: "proof.png" }],
+      });
+      yield* harness.call("pull_request_review", {
+        verdict: "comment",
+        body: "Looks good",
+        attachments: [{ path: "review.png" }],
+      });
+
+      expect(detailRequests).toEqual([{ allowStale: false }]);
+      expect(validatedPaths).toEqual([["after.png"]]);
+      expect(createdBodies).toEqual([
+        "Before and after\n\n![After](https://github.com/user-attachments/assets/after.png)",
+      ]);
+      expect(updatedBodies).toEqual([
+        "Existing body\n\n![img](https://github.com/user-attachments/assets/extra.png)",
+      ]);
+      expect(comments).toEqual(["![img](https://github.com/user-attachments/assets/proof.png)"]);
+      expect(responded.replied).toBe(true);
+      expect(reviewBodies).toEqual([
+        "Looks good\n\n![img](https://github.com/user-attachments/assets/review.png)",
+      ]);
+      expect(uploadedCalls).toHaveLength(4);
     }),
   );
 });

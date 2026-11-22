@@ -41,6 +41,7 @@ import {
 } from "../../../pullRequest/pullRequestTarget.ts";
 import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
+import * as SourceControlMediaUploadService from "../../../sourceControl/SourceControlMediaUploadService.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
@@ -49,7 +50,11 @@ const dependencies = [
   ProjectService.ProjectService,
 ];
 
-const forgeDependencies = [...dependencies, PullRequestService.PullRequestService];
+const forgeDependencies = [
+  ...dependencies,
+  PullRequestService.PullRequestService,
+  SourceControlMediaUploadService.SourceControlMediaUploadService,
+];
 
 const guideDependencies = [
   ...dependencies,
@@ -675,6 +680,21 @@ const ListPullRequestsTool = Tool.make("pull_request_list", {
   .annotate(Tool.OpenWorld, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenWithoutForge);
 
+export const MediaAttachmentInput = Schema.Struct({
+  path: TrimmedNonEmptyString.annotate({
+    description: "Local image or video path.",
+  }),
+  alt: Schema.optional(TrimmedNonEmptyString),
+});
+export type MediaAttachmentInput = typeof MediaAttachmentInput.Type;
+
+const MediaAttachmentsInput = Schema.Array(MediaAttachmentInput)
+  .check(Schema.isMinLength(1), Schema.isMaxLength(20))
+  .annotate({
+    description:
+      "Local images or videos to upload and embed. Paths in body rewrite; others append.",
+  });
+
 const CreatePullRequestTool = Tool.make("pull_request_create", {
   description: "Push this thread's branch, then open its PR and link it, or return its open PR.",
   parameters: Schema.Struct({
@@ -687,6 +707,7 @@ const CreatePullRequestTool = Tool.make("pull_request_create", {
       description:
         "Visible to writers only; the branch never reaches origin. Fails on a host without private PRs.",
     }),
+    attachments: Schema.optional(MediaAttachmentsInput),
   }),
   success: CreatePullRequestResult,
   failure: PullRequestToolError,
@@ -711,6 +732,7 @@ const UpdatePullRequestTool = Tool.make("pull_request_update", {
     ...ThreadPullRequestInput.fields,
     title: Schema.optional(TrimmedNonEmptyString),
     body: Schema.optional(Schema.String),
+    attachments: Schema.optional(MediaAttachmentsInput),
     ready: Schema.optional(Schema.Boolean),
     state: Schema.optional(Schema.Literals(["open", "closed"])),
     addLabels: Schema.optional(UpdateNames),
@@ -737,6 +759,7 @@ const RespondToPullRequestTool = Tool.make("pull_request_respond", {
     ...ThreadPullRequestInput.fields,
     reviewThreadId: Schema.optional(TrimmedNonEmptyString),
     body: Schema.optional(TrimmedNonEmptyString),
+    attachments: Schema.optional(MediaAttachmentsInput),
     resolved: Schema.optional(Schema.Boolean),
   }),
   success: RespondToPullRequestResult,
@@ -770,6 +793,7 @@ const ReviewPullRequestTool = Tool.make("pull_request_review", {
     ...ThreadPullRequestInput.fields,
     verdict: PullRequestReviewVerdict,
     body: Schema.optional(Schema.String),
+    attachments: Schema.optional(MediaAttachmentsInput),
     comments: Schema.optional(Schema.Array(ReviewLineComment).check(Schema.isMaxLength(50))),
   }),
   success: Schema.Struct(PullRequestIdentity),

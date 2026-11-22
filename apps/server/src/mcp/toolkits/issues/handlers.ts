@@ -1,4 +1,6 @@
 import {
+  IssueOperationError,
+  SourceControlProviderKind,
   threadIssueKeysEqual,
   type IssueDetail,
   type IssueRef,
@@ -6,6 +8,7 @@ import {
   type ProjectId,
   type ThreadId,
 } from "@t3tools/contracts";
+import type { MarkdownAttachmentInput } from "@t3tools/source-control-core/server/markdownAttachments";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -13,6 +16,9 @@ import * as Option from "effect/Option";
 import * as IssueService from "../../../issue/IssueService.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadIssueService from "../../../orchestration-v2/ThreadIssueService.ts";
+import * as ProjectService from "../../../project/ProjectService.ts";
+import * as SourceControlMediaUploadService from "../../../sourceControl/SourceControlMediaUploadService.ts";
+import { sourceControlDefinitions } from "../../../sourceControl/sourceControlDefinitions.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
@@ -59,6 +65,55 @@ const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const issues = yield* IssueService.IssueService;
   const threadIssues = yield* ThreadIssueService.ThreadIssueService;
+  const projects = yield* ProjectService.ProjectService;
+  const mediaUploads = yield* SourceControlMediaUploadService.SourceControlMediaUploadService;
+
+  const attachIssueMedia = Effect.fn("IssuesToolkit.attachMedia")(function* (input: {
+    readonly operation: string;
+    readonly projectId: ProjectId;
+    readonly tracker: string;
+    readonly host: string;
+    readonly scope: string;
+    readonly markdown: string;
+    readonly attachments: ReadonlyArray<MarkdownAttachmentInput> | undefined;
+  }) {
+    if (input.attachments === undefined || input.attachments.length === 0) {
+      return input.markdown;
+    }
+    const definition = sourceControlDefinitions.find(input.tracker);
+    if (definition === undefined) {
+      return yield* new IssueOperationError({
+        operation: input.operation,
+        detail: `Uploading media attachments is not supported on ${input.tracker}.`,
+      });
+    }
+    const thread = yield* callerThread();
+    const project = yield* projects.getShell(input.projectId).pipe(
+      Effect.map(Option.getOrUndefined),
+      Effect.orElseSucceed(() => undefined),
+    );
+    const cwd = thread?.worktreePath ?? project?.workspaceRoot ?? process.cwd();
+    const attached = yield* mediaUploads
+      .attachToMarkdown({
+        provider: SourceControlProviderKind.make(definition.kind),
+        host: input.host,
+        repository: input.scope,
+        cwd,
+        markdown: input.markdown,
+        attachments: input.attachments,
+      })
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new IssueOperationError({
+              operation: input.operation,
+              detail: error.message,
+              cause: error,
+            }),
+        ),
+      );
+    return attached.markdown;
+  });
 
   /** The caller's own thread, read when a tool defaults to it. */
   const callerThread = Effect.fn("IssuesToolkit.callerThread")(function* () {
@@ -234,10 +289,19 @@ const make = Effect.gen(function* () {
     create_issue: McpToolAccess.writesWithCapability((input) =>
       Effect.gen(function* () {
         const scope = yield* requireProjectScope(input.projectId, { scope: input.scope });
+        const body = yield* attachIssueMedia({
+          operation: "create",
+          projectId: scope.projectId,
+          tracker: scope.tracker,
+          host: scope.host,
+          scope: scope.scope,
+          markdown: input.body ?? "",
+          attachments: input.attachments,
+        });
         const created = yield* issues.create({
           ...scope,
           title: input.title,
-          body: input.body ?? "",
+          body,
           labels: input.labels ?? [],
           assignees: input.assignees ?? [],
         });
@@ -251,8 +315,23 @@ const make = Effect.gen(function* () {
     ),
     comment_on_issue: McpToolAccess.writesWithCapability((input) =>
       Effect.gen(function* () {
+        if (input.body === undefined && input.attachments === undefined) {
+          return yield* new IssueOperationError({
+            operation: "comment",
+            detail: "Pass body or attachments.",
+          });
+        }
         const target = yield* resolveTarget(input);
-        yield* issues.comment({ ...refOf(target), body: input.body });
+        const body = yield* attachIssueMedia({
+          operation: "comment",
+          projectId: target.projectId,
+          tracker: target.tracker,
+          host: target.host,
+          scope: target.scope,
+          markdown: input.body ?? "",
+          attachments: input.attachments,
+        });
+        yield* issues.comment({ ...refOf(target), body });
         return identityOf(target);
       }),
     ),

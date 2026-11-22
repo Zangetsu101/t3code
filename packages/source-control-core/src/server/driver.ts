@@ -5,11 +5,13 @@ import type {
   SourceControlSignInPrompt,
   SourceControlSignInResult,
 } from "@t3tools/contracts";
+import { SourceControlProviderKind as SourceControlProviderKindSchema } from "@t3tools/contracts";
 import type * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import type * as FileSystem from "effect/FileSystem";
 import type { HttpClient, HttpClientError, HttpClientResponse } from "effect/http";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import type * as FeatureFlags from "@t3tools/shared/FeatureFlags";
 
@@ -29,6 +31,98 @@ export interface SourceControlMediaRequest {
   readonly headers: Readonly<Record<string, string>>;
   /** `owner/name` of the change request the media is in, else of the checkout it was shown in. */
   readonly repository?: string;
+}
+
+export interface SourceControlMediaUploadRequest {
+  readonly host: string;
+  /** `owner/name` of the repository the attachment belongs to. */
+  readonly repository: string;
+  /** Absolute path to the local file to upload. */
+  readonly path: string;
+  readonly fileName: string;
+  readonly contentType: string;
+  readonly sizeBytes: number;
+}
+
+export class SourceControlMediaUploadError extends Schema.TaggedError<SourceControlMediaUploadError>()(
+  "SourceControlMediaUploadError",
+  {
+    provider: SourceControlProviderKindSchema,
+    reason: Schema.Literals([
+      "unsupported",
+      "unauthenticated",
+      "forbidden",
+      "rate-limited",
+      "invalid",
+      "failed",
+    ]),
+    code: Schema.optional(
+      Schema.Literals([
+        "host-unsupported",
+        "provider-unsupported",
+        "unsupported-type",
+        "file-unreadable",
+        "file-directory",
+        "file-not-regular",
+        "file-empty",
+        "file-too-large",
+        "invalid-repository",
+        "missing-repository-id",
+        "missing-asset-url",
+      ]),
+    ),
+    fileName: Schema.optional(Schema.String),
+    status: Schema.optional(Schema.Int),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    const target = this.fileName ?? "attachment";
+    switch (this.code) {
+      case "host-unsupported":
+        return `Attaching files is not supported on this ${this.provider} host.`;
+      case "provider-unsupported":
+        return `Uploading media attachments is not supported on ${this.provider}.`;
+      case "unsupported-type":
+        return `${target} is not a supported file type (supported: png, jpg, jpeg, gif, webp, svg, mp4, mov, webm).`;
+      case "file-unreadable":
+        return `${target}: file could not be read.`;
+      case "file-directory":
+        return `${target} is a directory.`;
+      case "file-not-regular":
+        return `${target} is not a regular file.`;
+      case "file-empty":
+        return `${target} is empty.`;
+      case "file-too-large":
+        return `${target} exceeds the maximum allowed file size.`;
+      case "invalid-repository":
+        return `Could not determine which ${this.provider} repository to attach ${target} to.`;
+      case "missing-repository-id":
+        return `Could not determine the repository ID on ${this.provider} for ${target}.`;
+      case "missing-asset-url":
+        return `Could not upload ${target}: ${this.provider} returned no asset URL.`;
+      case undefined:
+        break;
+    }
+    switch (this.reason) {
+      case "unsupported":
+        return `Uploading media attachments is not supported on ${this.provider}.`;
+      case "unauthenticated":
+        return `Could not upload ${target}: ${this.provider} authentication is unavailable.`;
+      case "forbidden":
+        return `Could not upload ${target}: attaching files requires write access to the repository and a credential that supports uploads.`;
+      case "rate-limited":
+        return `Could not upload ${target}: ${this.provider} rate limit exceeded. Wait and try again.`;
+      case "invalid":
+        return this.status === undefined
+          ? `Could not upload ${target}: invalid media attachment.`
+          : `Could not upload ${target}: ${this.provider} rejected the attachment (HTTP ${this.status}).`;
+      case "failed":
+        return this.status === undefined
+          ? `Could not upload ${target} to ${this.provider}.`
+          : `Could not upload ${target}: ${this.provider} returned HTTP ${this.status}.`;
+    }
+  }
 }
 
 /** The server side of a definition's `credentials.appSignIn`. */
@@ -68,6 +162,13 @@ export interface SourceControlDriverInstance {
     HttpClientError.HttpClientError,
     Scope.Scope
   >;
+  /**
+   * Uploads a local media file to the host for embedding in change requests or issues,
+   * returning the hosted asset URL. Absent on hosts that do not support media uploads.
+   */
+  readonly uploadMedia?: (
+    request: SourceControlMediaUploadRequest,
+  ) => Effect.Effect<{ readonly url: string }, SourceControlMediaUploadError>;
   readonly signIn?: SourceControlSignIn;
   /** Whether the server's account on `host` starred `repository` (`owner/name`). */
   readonly isRepositoryStarred?: (host: string, repository: string) => Effect.Effect<boolean>;

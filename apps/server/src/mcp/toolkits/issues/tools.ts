@@ -21,6 +21,7 @@ import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ThreadIssueService from "../../../orchestration-v2/ThreadIssueService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as SourceControlMediaUploadService from "../../../sourceControl/SourceControlMediaUploadService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const dependencies = [
@@ -30,6 +31,7 @@ const dependencies = [
   ProjectService.ProjectService,
   IssueService.IssueService,
   ThreadIssueService.ThreadIssueService,
+  SourceControlMediaUploadService.SourceControlMediaUploadService,
 ];
 
 /**
@@ -278,6 +280,20 @@ const ReadIssueTool = Tool.make("read_issue", {
   .annotate(Tool.Idempotent, true)
   .annotate(Tool.OpenWorld, true);
 
+const IssueMediaAttachmentInput = Schema.Struct({
+  path: TrimmedNonEmptyString.annotate({
+    description: "Local image or video path.",
+  }),
+  alt: Schema.optional(TrimmedNonEmptyString),
+});
+
+const IssueMediaAttachmentsInput = Schema.Array(IssueMediaAttachmentInput)
+  .check(Schema.isMinLength(1), Schema.isMaxLength(20))
+  .annotate({
+    description:
+      "Local images or videos to upload and embed. Paths in body rewrite; others append.",
+  });
+
 const CreateIssueTool = Tool.make("create_issue", {
   description: "File an issue in a project's tracker.",
   parameters: Schema.Struct({
@@ -291,6 +307,7 @@ const CreateIssueTool = Tool.make("create_issue", {
     ),
     title: TrimmedNonEmptyString.check(Schema.isMaxLength(1024)),
     body: Schema.optional(Schema.String.check(Schema.isMaxLength(65_536))),
+    attachments: Schema.optional(IssueMediaAttachmentsInput),
     labels: Schema.optional(Schema.Array(TrimmedNonEmptyString).check(Schema.isMaxLength(50))),
     assignees: Schema.optional(Schema.Array(TrimmedNonEmptyString).check(Schema.isMaxLength(25))),
   }),
@@ -308,7 +325,10 @@ const CommentOnIssueTool = Tool.make("comment_on_issue", {
   description: "Post a comment on an issue.",
   parameters: Schema.Struct({
     ...IssueTargetInput.fields,
-    body: Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(65_536)),
+    body: Schema.optional(
+      Schema.String.check(Schema.isNonEmpty()).check(Schema.isMaxLength(65_536)),
+    ),
+    attachments: Schema.optional(IssueMediaAttachmentsInput),
   }),
   success: IssueWriteResult,
   failure: IssueToolError,

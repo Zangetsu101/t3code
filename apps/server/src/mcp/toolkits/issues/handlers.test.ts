@@ -29,6 +29,7 @@ import { v2PullRequestThread } from "../../../orchestration-v2/testkit/pullReque
 import * as IssueTrackerBindings from "../../../persistence/IssueTrackerBindings.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import * as SourceControlMediaUploadService from "../../../sourceControl/SourceControlMediaUploadService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as McpToolAccessTestkit from "../../McpToolAccess.testkit.ts";
@@ -148,10 +149,14 @@ const projectLayer = Layer.mock(ProjectService.ProjectService)({
 const makeHarness = Effect.fn("makeIssuesToolkitHarness")(function* (
   issues: ReadonlyArray<ThreadIssueLink> = [],
   issueLayer?: Layer.Layer<IssueService.IssueService>,
+  mediaUploads?: Partial<
+    SourceControlMediaUploadService.SourceControlMediaUploadService["Service"]
+  >,
 ) {
   const links = yield* Ref.make<ReadonlyArray<ThreadIssueService.LinkThreadIssueInput>>([]);
   const layerDependencies = Layer.mergeAll(
     projectLayer,
+    Layer.mock(SourceControlMediaUploadService.SourceControlMediaUploadService)(mediaUploads ?? {}),
     Layer.mock(Orchestrator.OrchestratorV2)({
       getThreadShell: (id) => Effect.succeed(id === THREAD_ID ? makeThread(issues) : null),
     }),
@@ -440,6 +445,74 @@ describe("issue toolkit handlers", () => {
       expect(result.issues).toMatchObject([{ key: "7", title: "Seven", displayKey: "#7" }]);
       const unlinked = yield* harness.call("unlink_issue", { url: detail.url });
       expect(unlinked.wasLinked).toBe(true);
+    }),
+  );
+
+  it.effect("uploads attachments in create_issue and comment_on_issue", () =>
+    Effect.gen(function* () {
+      const createdBodies: Array<string> = [];
+      const commentBodies: Array<string> = [];
+      const harness = yield* makeHarness(
+        [],
+        Layer.mock(IssueService.IssueService)({
+          projectScope: (projectId) =>
+            Effect.succeed({
+              projectId,
+              tracker: GITHUB,
+              host: "github.com",
+              scope: "t3tools/t3code",
+            }),
+          resolveUrl: () =>
+            Effect.succeed({
+              projectId: PROJECT_ID,
+              tracker: GITHUB,
+              host: "github.com",
+              scope: "t3tools/t3code",
+              key: "7",
+              writable: true,
+            }),
+          create: (input) =>
+            Effect.sync(() => {
+              createdBodies.push(input.body);
+              return {
+                key: "8",
+                displayKey: "#8",
+                url: "https://github.com/t3tools/t3code/issues/8",
+              };
+            }),
+          comment: (input) =>
+            Effect.sync(() => {
+              commentBodies.push(input.body);
+            }),
+        }),
+        {
+          attachToMarkdown: (input) =>
+            Effect.succeed({
+              markdown:
+                input.markdown === ""
+                  ? `![shot](https://github.com/user-attachments/assets/${input.attachments[0]?.path})`
+                  : `${input.markdown}\n\n![shot](https://github.com/user-attachments/assets/${input.attachments[0]?.path})`,
+              uploaded: [],
+            }),
+        },
+      );
+
+      yield* harness.call("create_issue", {
+        title: "Broken layout",
+        body: "See screenshot",
+        attachments: [{ path: "bug.png" }],
+      });
+      yield* harness.call("comment_on_issue", {
+        url: "https://github.com/t3tools/t3code/issues/7",
+        attachments: [{ path: "repro.png" }],
+      });
+
+      expect(createdBodies).toEqual([
+        "See screenshot\n\n![shot](https://github.com/user-attachments/assets/bug.png)",
+      ]);
+      expect(commentBodies).toEqual([
+        "![shot](https://github.com/user-attachments/assets/repro.png)",
+      ]);
     }),
   );
 });
